@@ -1,4 +1,0 @@
-browser-use
-langchain-google-vertexai>=0.1.0
-python-dotenv>=1.0.0
-google-cloud-aiplatform>=1.35.0
