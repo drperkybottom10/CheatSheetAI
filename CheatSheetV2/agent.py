@@ -1,27 +1,47 @@
 from langchain_google_genai import ChatGoogleGenerativeAI
 from browser_use import Agent, BrowserConfig, Browser
 from browser_use.browser.context import BrowserContextConfig
-from browser_use.controller.service import Controller
+from browser_use.controller.service import Controller, ActionResult
 import asyncio
 from dotenv import load_dotenv
+import json
 import os
-from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Callable
 import logging
+from CheatSheetV2.assignment_types import handle_quiz
+from ml_component import MLComponent, extract_features, create_label
+from concurrent.futures import ThreadPoolExecutor
+import google.generativeai as genai
+import tiktoken
+from pydantic import BaseModel
+
+# Import new modules
+from login import login_to_canvas
+from course_navigation import search_for_course, navigate_to_course
+from assignment_navigation import search_for_assignment, navigate_to_assignment
+from assignment_details import extract_assignment_details
+from assignment_completion import fill_in_assignment, complete_assignment, submit_assignment
+from google_docs import create_blank_doc, make_copy_of_google_doc, filter_google_docs_links, handle_google_doc
+from utils import generate_assignment_response, check_plagiarism, set_reminders, analyze_assignment_description
 
 # Load environment variables from .env file
 load_dotenv()
 
 # Initialize logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Initialize Gemini API
+genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
+model = genai.GenerativeModel('gemini-1.5-flash-002')
 
 # Initialize browser configuration with headless mode for speed
 browser_config = BrowserConfig(
     headless=False,  # Enable headless mode for faster execution
-    disable_security=True,
+    disable_security=True,  # Ensure this is compatible with the latest browser-use library
     extra_chromium_args=[
         '--disable-blink-features=AutomationControlled',
+        '--disable-dev-shm-usage',
         '--start-maximized',
         '--no-first-run',
         '--no-default-browser-check',
@@ -43,11 +63,14 @@ context_config = BrowserContextConfig(
 # Update browser config with context config
 browser_config.new_context_config = context_config
 
-# Initialize the LLM with the correct model name (now using chat-bison-001)
+# Initialize the LLM with the correct model name (now using gemini-2.0-flash-exp)
 llm = ChatGoogleGenerativeAI(
-    model="chat-bison-001",
-    google_api_key=os.getenv("GOOGLE_API_KEY")
+    model='gemini-1.5-flash-002',
+    api_key=os.getenv("GOOGLE_API_KEY")
 )
+
+# Initialize ML component
+ml_component = MLComponent()
 
 # Pydantic models for structured parameters
 class GoogleCredentials(BaseModel):
@@ -66,358 +89,124 @@ class AssignmentData(BaseModel):
     links: List[str] = []
     attachments: List[str] = []
 
-class DocumentCopyDetails(BaseModel):
-    original_url: str
-    new_title: Optional[str] = None
-
 class FillAssignmentDetails(BaseModel):
     doc_url: str
     assignment_content: str
+
+class AssignmentSubmissionDetails(BaseModel):
+    assignment_url: str
+    submission_type: str
+    file_path: Optional[str] = None
+    text_content: Optional[str] = None
+
+class SearchCourseParams(BaseModel):
+    course_name: str
+
+class NavigateCourseParams(BaseModel):
+    course_selector: str
+
+class SearchAssignmentParams(BaseModel):
+    assignment_name: str
+
+class NavigateAssignmentParams(BaseModel):
+    assignment_selector: str
+
+class CompleteAssignmentParams(BaseModel):
+    assignment_details: dict
+
+# Define new Pydantic model for DocumentCopyDetails
+class DocumentCopyDetails(BaseModel):
+    original_url: str
+    new_title: Optional[str] = None  # Ensure optional title handling is consistent
 
 # Initialize controller
 controller = Controller()
 
 # Register custom actions with optimized implementations
-@controller.action("Login to Canvas", requires_browser=True)
-async def login_to_canvas(params: GoogleCredentials, browser: Browser):
-    try:
-        logger.info("Attempting to log into Canvas.")
-        await browser.goto("https://baps.instructure.com/login")
-        await browser.fill('input[name="pseudonym_session[unique_id]"]', params.email)
-        await browser.fill('input[name="pseudonym_session[password]"]', params.password)
-        await browser.click('button[name="submit"]')
-        await browser.wait_for_selector('selector-for-dashboard', timeout=1000)  # FASTER
-        return "Logged into Canvas successfully."
-    except Exception as e:
-        logger.error(f"Canvas login failed: {e}")
-        return f"Canvas login failed: {str(e)}"
-
-@controller.action("Navigate to Course", requires_browser=True)
-async def navigate_to_course(course_selector: str, browser: Browser):
-    try:
-        logger.info(f"Navigating to course: {course_selector}")
-        await browser.wait_for_selector(f"text='{course_selector}'", timeout=1000)  # FASTER
-        await browser.click(f"text='{course_selector}'")
-        await browser.wait_for_selector('selector-for-course-page', timeout=1000)   # FASTER
-        return f"Navigated to course: {course_selector}"
-    except Exception as e:
-        logger.error(f"Navigation to course failed: {e}")
-        return f"Navigation to course failed: {str(e)}"
-
-@controller.action("Navigate to Assignment", requires_browser=True)
-async def navigate_to_assignment(assignment_selector: str, browser: Browser):
-    try:
-        logger.info(f"Navigating to assignment: {assignment_selector}")
-        await browser.wait_for_selector(f"text='{assignment_selector}'", timeout=1000)  # FASTER
-        await browser.click(f"text='{assignment_selector}'")
-        await browser.wait_for_selector('selector-for-assignment-page', timeout=1000)   # FASTER
-        return f"Navigated to assignment: {assignment_selector}"
-    except Exception as e:
-        logger.error(f"Navigation to assignment failed: {e}")
-        return f"Navigation to assignment failed: {str(e)}"
-
-@controller.action("Extract Assignment Details", requires_browser=True)
-async def extract_assignment_details(browser: Browser) -> AssignmentData:
-    try:
-        logger.info("Extracting assignment details.")
-        description = await browser.evaluate('document.querySelector(".description").innerText')
-        instructions = await browser.evaluate('document.querySelector(".instructions").innerText')
-        links = await browser.evaluate('Array.from(document.querySelectorAll("a")).map(a => a.href)')
-        attachments = await browser.evaluate('Array.from(document.querySelectorAll("a.download")).map(a => a.href)')
-        return AssignmentData(
-            description=description,
-            instructions=instructions,
-            links=links,
-            attachments=attachments
-        )
-    except Exception as e:
-        logger.error(f"Failed to extract assignment details: {e}")
-        return AssignmentData(description="", instructions="", links=[], attachments=[])
-
-@controller.action("Filter Google Docs Links", requires_browser=True)
-async def filter_google_docs_links(links: List[str]) -> List[str]:
-    google_docs_links = [link for link in links if "docs.google.com/document" in link]
-    return google_docs_links
-
-@controller.action("Login to Google", param_model=GoogleCredentials, requires_browser=True)
-async def login_to_google(params: GoogleCredentials, browser: Browser):
-    try:
-        logger.info("Attempting to log into Google.")
-        await browser.goto("https://accounts.google.com/signin")
-        await browser.fill('input[type="email"]', params.email)
-        await browser.click('button[jsname="LgbsSe"]')
-        await browser.wait_for_selector('input[type="password"]', timeout=5000)  # Wait for password field
-        await browser.fill('input[type="password"]', params.password)
-        await browser.click('button[jsname="LgbsSe"]')
-        await browser.wait_for_selector('selector-for-logged-in-state', timeout=5000)  # Event-based wait
-        return "Successfully logged into Google"
-    except Exception as e:
-        logger.error(f"Google login failed: {e}")
-        return f"Login failed: {str(e)}"
-
-@controller.action("Log out of Google", requires_browser=True)
-async def logout_of_google(browser: Browser):
-    try:
-        logger.info("Logging out of Google.")
-        await browser.goto("https://accounts.google.com/Logout")
-        await browser.wait_for_selector('selector-for-logged-out-state', timeout=5000)  # Event-based wait
-        return "Logged out of Google successfully."
-    except Exception as e:
-        logger.error(f"An error occurred during Google logout: {e}")
-        return f"An error occurred during Google logout: {str(e)}"
-
-@controller.action("Make a copy of Google Doc", param_model=DocumentCopyDetails, requires_browser=True)
-async def make_copy_of_google_doc(params: DocumentCopyDetails, browser: Browser):
-    try:
-        logger.info(f"Making a copy of Google Doc: {params.original_url}")
-        copy_url = f"{params.original_url}/copy"
-        await browser.goto(copy_url)
-        if params.new_title:
-            await browser.fill('input[name="title"]', params.new_title)
-        await browser.click('button[jsname="LgbsSe"]')  # Click "OK" to make a copy
-        await browser.wait_for_selector('selector-for-new-doc', timeout=5000)  # Event-based wait
-        new_doc_url = browser.url
-        return new_doc_url
-    except Exception as e:
-        logger.error(f"Failed to make a copy: {e}")
-        return f"Failed to make a copy: {str(e)}"
-
-@controller.action("Fill in assignment", param_model=FillAssignmentDetails, requires_browser=True)
-async def fill_in_assignment(params: FillAssignmentDetails, browser: Browser):
-    try:
-        logger.info(f"Filling in assignment for doc: {params.doc_url}")
-        await browser.goto(params.doc_url)
-        await browser.wait_for_selector("div[role='textbox']", timeout=1000)  # FASTER
-        await browser.click("div[role='textbox']")
-        await browser.type("div[role='textbox']", params.assignment_content, delay=0.01)  # FASTER
-        return "Assignment filled successfully."
-    except Exception as e:
-        logger.error(f"Failed to fill in assignment: {e}")
-        return f"Failed to fill in assignment: {str(e)}"
-
-@controller.action("Open new tab", requires_browser=True)
-async def open_new_tab(browser: Browser):
-    try:
-        logger.info("Opening a new tab.")
-        new_page = await browser.context.new_page()
-        await new_page.bring_to_front()
-        return "Opened a new tab successfully."
-    except Exception as e:
-        logger.error(f"Failed to open new tab: {e}")
-        return f"Failed to open new tab: {str(e)}"
-
-@controller.action("Create blank doc", requires_browser=True)
-async def create_blank_doc(browser: Browser):
-    try:
-        logger.info("Creating a new blank Google Doc.")
-        new_page = await browser.context.new_page()
-        await new_page.bring_to_front()
-        await new_page.goto("https://docs.google.com/document/create")
-        await new_page.wait_for_selector("div[role='textbox']", timeout=5000)
-        return "Created a new blank Google Doc successfully."
-    except Exception as e:
-        logger.error(f"Error creating new blank doc: {e}")
-        return f"Error creating new blank doc: {str(e)}"
-
-@controller.action("Close error popup", requires_browser=True)
-async def close_error_popup(browser: Browser):
-    try:
-        logger.info("Closing error popup.")
-        await browser.click('button[aria-label="Close"]')
-        return "Successfully closed error popup."
-    except Exception as e:
-        logger.error(f"Failed to close error popup: {e}")
-        return f"Failed to close error popup: {str(e)}"
-
-@controller.action("Handle Google Doc", param_model=DocumentDetails, requires_browser=True)
-async def handle_google_doc(params: DocumentDetails, browser: Browser):
-    try:
-        logger.info(f"Handling Google Doc: {params.url}")
-        if params.url:
-            await browser.goto(params.url)
-        await browser.wait_for_selector("div[role='textbox']", timeout=5000)
-        content = await browser.evaluate('document.querySelector("div[role=\'textbox\']").innerText')
-        return DocumentDetails(
-            url=params.url,
-            content=content,
-            is_assignment=params.is_assignment
-        )
-    except Exception as e:
-        logger.error(f"Failed to handle Google Doc: {e}")
-        return DocumentDetails(url=params.url, content="", is_assignment=False)
-
-@controller.action("Navigate Google Doc", param_model=DocumentDetails, requires_browser=True)
-async def navigate_google_doc(params: DocumentDetails, browser: Browser):
-    try:
-        logger.info("Navigating Google Doc.")
-        # Add keyboard shortcuts for navigation
-        await browser.keyboard.press("Control+Home")  # Go to start
-        await browser.keyboard.press("Control+A")     # Select all
-        await browser.keyboard.press("Control+C")     # Copy content
-        
-        # Extract text content more reliably
-        content = await browser.evaluate("""
-            () => {
-                const textboxes = document.querySelectorAll('div[role="textbox"]');
-                return Array.from(textboxes).map(box => box.innerText).join('\\n');
-            }
-        """)
-        
-        # Parse document structure
-        sections = await browser.evaluate("""
-            () => {
-                const headers = document.querySelectorAll('[role="heading"]');
-                return Array.from(headers).map(h => ({
-                    text: h.innerText,
-                    level: h.getAttribute('aria-level')
-                }));
-            }
-        """)
-        
-        return DocumentDetails(content=content, structure=sections)
-    except Exception as e:
-        logger.error(f"Navigation failed: {e}")
-        return f"Navigation failed: {str(e)}"
-
-@controller.action("Analyze Assignment", param_model=AssignmentData, requires_browser=True)
-async def analyze_assignment(params: AssignmentData, browser: Browser):
-    try:
-        logger.info("Analyzing assignment.")
-        instructions = await browser.evaluate("""
-            () => {
-                const instructionBlocks = document.querySelectorAll('.assignment-description p');
-                return Array.from(instructionBlocks).map(p => p.innerText);
-            }
-        """)
-        requirements = await browser.evaluate("""
-            () => {
-                const lists = document.querySelectorAll('ul, ol');
-                return Array.from(lists).map(list =>
-                    Array.from(list.children).map(item => item.innerText)
-                );
-            }
-        """)
-        
-        return {
-            'instructions': instructions,
-            'requirements': requirements
-        }
-    except Exception as e:
-        logger.error(f"Analysis failed: {e}")
-        return f"Analysis failed: {str(e)}"
-
-@controller.action("Interact with Doc", requires_browser=True)
-async def interact_with_doc(browser: Browser):
-    try:
-        logger.info("Interacting with Google Doc.")
-        # Use more precise selectors
-        await browser.evaluate("""
-            () => {
-                // Focus on editable area
-                const textbox = document.querySelector('div[role="textbox"]');
-                if (textbox) {
-                    textbox.focus();
-                }
-                
-                // Set cursor position
-                const selection = window.getSelection();
-                const range = document.createRange();
-                range.selectNodeContents(textbox);
-                selection.removeAllRanges();
-                selection.addRange(range);
-            }
-        """)
-        
-        # Support rich text editing
-        await browser.keyboard.type('/heading')  # Google Docs command menu
-        await browser.keyboard.press('Enter');
-        
-        return "Document interaction successful"
-    except Exception as e:
-        logger.error(f"Interaction failed: {e}")
-        return f"Interaction failed: {str(e)}"
-
-@controller.action("Mouse Navigation", requires_browser=True)
-async def mouse_navigation(browser: Browser):
-    try:
-        logger.info("Performing mouse navigation.")
-        # Get viewport size
-        viewport = await browser.evaluate('() => ({width: window.innerWidth, height: window.innerHeight})')
-        
-        # Smooth mouse movement
-        await browser.mouse.move(viewport['width']/2, viewport['height']/2, steps=5)
-        await browser.mouse.down()
-        await browser.mouse.move(viewport['width']/2, viewport['height']/2 + 100, steps=5)
-        await browser.mouse.up()
-        
-        return "Mouse navigation completed"
-    except Exception as e:
-        logger.error(f"Mouse navigation failed: {e}")
-        return f"Mouse navigation failed: {str(e)}"
-
-# Add a new environment variable for quiz access code
-quiz_access_code = os.getenv("QUIZ_ACCESS_CODE")
-
-@controller.action("Take Canvas Quiz", requires_browser=True)
-async def take_canvas_quiz(browser: Browser):
-    """
-    Reads each quiz question, optionally enters the quiz access code,
-    then selects the answer. Adjust DOM selectors and logic as needed.
-    """
-    try:
-        logger.info("Taking Canvas quiz.")
-        # If a quiz access code is required, fill it in before proceeding
-        if quiz_access_code:
-            await browser.wait_for_selector('.quiz-access-code', timeout=5000)
-            await browser.fill('.quiz-access-code', quiz_access_code)
-            await browser.click('button.submit-access-code')
-            await browser.wait_for_selector('.quiz-container', timeout=5000)
-
-        # Wait for quiz container
-        await browser.wait_for_selector('.quiz-container', timeout=5000)
-
-        # Example: find all questions
-        question_selectors = await browser.evaluate('Array.from(document.querySelectorAll(".quiz-question")).map((el, idx) => `.quiz-question:nth-of-type(${idx + 1})`)')
-        for question_sel in question_selectors:
-            question_text = await browser.evaluate(f'document.querySelector("{question_sel} .question-text").innerText')
-            # Placeholder "correct" answer logic (replace with your actual method)
-            possible_answers = await browser.evaluate(f'Array.from(document.querySelectorAll("{question_sel} .answer-option")).map(a => a.innerText)')
-            
-            # Simple example: picks the first answer
-            if possible_answers:
-                await browser.click(f'{question_sel} .answer-option input[type="radio"]')
-
-        # Submit quiz (update selector to match your layout)
-        await browser.click('button.submit-quiz')
-        await browser.wait_for_selector('.quiz-complete', timeout=5000)
-        return "Quiz completed."
-    except Exception as e:
-        logger.error(f"Failed to complete quiz: {e}")
-        return f"Failed to complete quiz: {str(e)}"
+controller.action("Login to Canvas", param_model=GoogleCredentials)(login_to_canvas)
+controller.action("Search for course", param_model=SearchCourseParams)(search_for_course)
+controller.action("Navigate to Course", param_model=NavigateCourseParams)(navigate_to_course)
+controller.action("Search for assignment", param_model=SearchAssignmentParams)(search_for_assignment)
+controller.action("Navigate to Assignment", param_model=NavigateAssignmentParams)(navigate_to_assignment)
+controller.action("Extract assignment details")(extract_assignment_details)
+controller.action("Fill in assignment", param_model=FillAssignmentDetails)(fill_in_assignment)
+controller.action("Complete assignment", param_model=CompleteAssignmentParams)(complete_assignment)
+controller.action("Submit assignment", param_model=AssignmentSubmissionDetails)(submit_assignment)
+controller.action("Generate assignment response")(generate_assignment_response)
+controller.action("Check plagiarism")(check_plagiarism)
+controller.action("Set reminders")(set_reminders)
+controller.action("handle_google_doc", param_model=DocumentDetails)(handle_google_doc)
 
 async def run_agent_task(agent_task: str, llm: ChatGoogleGenerativeAI, controller: Controller, browser: Browser):
     agent = Agent(
         task=agent_task,
         llm=llm,
-        controller=controller,  # Corrected typo
+        controller=controller,
         use_vision=True,
         save_conversation_path="logs/conversation.json",
-        browser=browser
+        browser=browser  # Ensure browser object is correctly initialized
     )
-    return await agent.run()
+    try:
+        result = await agent.run()
+        if not result:
+            raise ValueError("Agent returned an empty result")
+        
+        # Attempt to parse the result
+        try:
+            parsed_result = json.loads(result)
+        except json.JSONDecodeError:
+            logger.error(f"Failed to parse agent result: {result}")
+            raise ValueError("Could not parse agent result as JSON")
+        
+        logger.info(f"Agent task completed successfully: {parsed_result}")
+        return result
+    except Exception as e:
+        logger.error(f"Agent run failed: {str(e)}", exc_info=True)
+        # Train ML model with the result
+        features = extract_features(str(result))
+        label = create_label(str(result))
+        ml_component.train(features, [label])
+        return f"Agent run failed: {str(e)}"
 
-async def main():
+executor = ThreadPoolExecutor(max_workers=5)
+
+async def run_action(action_name: str, **kwargs) -> ActionResult:
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(
+        executor,
+        lambda: controller.run_action(action_name, **kwargs)
+    )
+    # Use ML model to predict success of action
+    features = extract_features(str(result))
+    prediction = ml_component.predict(features)
+    logger.info(f"ML prediction for action {action_name}: {prediction}")
+    return result
+
+async def run_actions_concurrently(*actions):
+    tasks = []
+    for action in actions:
+        tasks.append(run_action(**action))
+    results = await asyncio.gather(*tasks)
+    return results
+
+async def main(progress_callback: Optional[Callable[[str], None]] = None):
     try:
         # Validate environment variables
+        logger.info("Validating environment variables...")
         required_env_vars = [
             "USERNAME", "PASSWORD", "COURSE_SELECTOR",
-            "ASSIGNMENT_SELECTOR", "GOOGLE_EMAIL",
-            "GOOGLE_PASSWORD", "PROVIDED_GOOGLE_DOC_URL"
+            "ASSIGNMENT_SELECTOR", "GOOGLE_EMAIL",  # Ensure all required variables are validated
+            "GOOGLE_PASSWORD", "PROVIDED_GOOGLE_DOC_URL",
+            "GOOGLE_API_KEY"
         ]
 
         missing_vars = [var for var in required_env_vars if not os.getenv(var)]
-        if missing_vars:
+        if (missing_vars):
             raise EnvironmentError(f"Missing required environment variables: {', '.join(missing_vars)}")
+
+        if progress_callback:
+            progress_callback("Environment variables validated successfully.")
+        logger.info("Environment variables validated successfully.")
 
         # Get environment variables
         username = os.getenv("USERNAME")
@@ -427,9 +216,6 @@ async def main():
         google_email = os.getenv("GOOGLE_EMAIL")
         google_password = os.getenv("GOOGLE_PASSWORD")
         provided_google_doc_url = os.getenv("PROVIDED_GOOGLE_DOC_URL")
-
-        # Initialize Browser with config
-        browser = Browser(config=browser_config)
 
         # Define the main task with a shorter, more concise format
         main_task = f"""
@@ -443,51 +229,147 @@ async def main():
            - Make copy and complete assignment
         7. If quiz, enter access code if needed
         8. Never click submission attempts or downloads
+        9. Generate assignment response
+        10. Check for plagiarism
+        11. Set reminders for due dates
+        12. Submit the completed assignment
         """
 
-        # Run the main agent task
-        main_result = await run_agent_task(main_task, llm, controller, browser)
-        print(main_result)
+        # Initialize the browser without calling a nonexistent 'start' method
+        browser = Browser(config=browser_config)
 
-        # Extract Google Docs links from the assignment details
-        doc_links = await filter_google_docs_links((await extract_assignment_details(browser)).links)
+        try:
+            # Run the main agent task
+            main_result = await run_agent_task(main_task, llm, controller, browser)
+            logger.info(f"Main agent task result: {main_result}")
+            
+            # Check if the task was actually completed
+            if "completed successfully" not in str(main_result).lower():
+                raise Exception("Task was not completed successfully")
 
-        if not doc_links and provided_google_doc_url:
-            # Open provided Google Doc
-            await handle_google_doc(DocumentDetails(url=provided_google_doc_url), browser)
-            new_doc_url = await make_copy_of_google_doc(DocumentCopyDetails(original_url=provided_google_doc_url, new_title="Copied Assignment"), browser)
-            if new_doc_url.startswith("http"):
-                fill_result = await fill_in_assignment(FillAssignmentDetails(doc_url=new_doc_url, assignment_content="Completed assignment content here..."), browser)
-                print(fill_result)
-        elif doc_links:
-            # Run agents concurrently for each Google Doc link
-            copy_tasks = [
-                make_copy_of_google_doc(DocumentCopyDetails(original_url=link, new_title="Copied Assignment"), browser) for link in doc_links
-            ]
-            copied_docs = await asyncio.gather(*copy_tasks)
-
-            fill_tasks = []
-            for new_doc_url in copied_docs:
-                if new_doc_url.startswith("http"):
-                    fill_tasks.append(fill_in_assignment(FillAssignmentDetails(doc_url=new_doc_url, assignment_content="Completed assignment content here..."), browser))
-                else:
-                    print(new_doc_url)  # Error message
-
-            fill_results = await asyncio.gather(*fill_tasks)
-            for result in fill_results:
-                print(result)
-        else:
-            # No links and no provided doc, create a new blank doc
-            create_result = await create_blank_doc(browser)
-            print(create_result)
+            # Extract Google Docs links from the assignment details
+            assignment_details = await extract_assignment_details(browser)
+            doc_links = await filter_google_docs_links(assignment_details["links"])
+            
+            # Verify that we're on the correct assignment page
+            if assignment_selector.lower() not in assignment_details["title"].lower():
+                logger.warning(f"Navigated to incorrect assignment: {assignment_details['title']}")
+                # Implement course correction here
+                await navigate_to_correct_assignment(browser, assignment_selector)
+                assignment_details = await extract_assignment_details(browser)
+            
+            # Process the assignment based on its type
+            if assignment_details["type"] == "quiz":
+                await handle_quiz(assignment_details, browser)
+            elif doc_links:
+                await process_google_docs(doc_links, assignment_details, browser)
+            else:
+                await handle_other_assignment_type(assignment_details, browser)
+            
+        except Exception as e:
+            logger.error(f"An error occurred while processing the main task: {str(e)}")
+            if progress_callback:
+                progress_callback(f"An error occurred: {str(e)}")
+            
+            # Implement error recovery and course correction
+            await error_recovery_and_course_correction(browser, e)
 
     except Exception as e:
         logger.error(f"An error occurred: {e}")
 
-    finally:
-        # Ensure the browser is closed even if an error occurs
-        if 'browser' in locals():
-            await browser.close()
+    return "CheatSheet AI process completed."
+
+async def navigate_to_correct_assignment(browser: Browser, assignment_selector: str):
+    try:
+        logger.info(f"Attempting to navigate to the correct assignment: {assignment_selector}")
+        await browser.goto("https://baps.instructure.com/")
+        await asyncio.sleep(2)
+        
+        # Navigate to the correct course
+        course_selector = os.getenv("COURSE_SELECTOR")
+        course_link = await browser.query_selector(f"a:has-text('{course_selector}')")
+        if course_link:
+            await course_link.click()
+            await browser.wait_for_navigation()
+        
+        # Find and click on the correct assignment
+        assignment_link = await browser.query_selector(f"a:has-text('{assignment_selector}')")
+        if assignment_link:
+            await assignment_link.click()
+            await browser.wait_for_navigation()
+        else:
+            raise Exception(f"Could not find assignment: {assignment_selector}")
+        
+        logger.info(f"Successfully navigated to assignment: {assignment_selector}")
+    except Exception as e:
+        logger.error(f"Failed to navigate to correct assignment: {str(e)}")
+        raise
+
+async def process_google_docs(doc_links: List[str], assignment_details: dict, browser: Browser):
+    try:
+        for doc_link in doc_links:
+            doc_details = DocumentDetails(url=doc_link, is_assignment=True)
+            await handle_google_doc(doc_details, browser)
+    except Exception as e:
+        logger.error(f"Error processing Google Docs: {str(e)}")
+        raise
+
+async def error_recovery_and_course_correction(browser: Browser, error: Exception):
+    try:
+        logger.info(f"Attempting error recovery and course correction for error: {str(error)}")
+        # Check if we're logged out
+        if "login" in browser.url.lower():
+            await login_to_canvas(GoogleCredentials(email=os.getenv("USERNAME"), password=os.getenv("PASSWORD")), browser)
+        
+        # If we're on an unexpected page, try to navigate back to the main course page
+        course_selector = os.getenv("COURSE_SELECTOR")
+        assignment_selector = os.getenv("ASSIGNMENT_SELECTOR")
+        if course_selector not in await browser.title():
+            await browser.goto("https://baps.instructure.com/")
+            await asyncio.sleep(2)
+            course_link = await browser.query_selector(f"a:has-text('{course_selector}')")
+            if course_link:
+                await course_link.click()
+                await browser.wait_for_navigation()
+        
+        # Try to find and navigate to the correct assignment again
+        await navigate_to_correct_assignment(browser, assignment_selector)
+        logger.info("Error recovery and course correction completed")
+    except Exception as e:
+        logger.error(f"Error recovery failed: {str(e)}")
+        raise
+
+async def handle_other_assignment_type(assignment_details: dict, browser: Browser):
+    """Handle assignments that are neither quizzes nor Google Docs."""
+    try:
+        logger.info(f"Handling other assignment type: {assignment_details.get('title')}")
+        # Implement the logic for handling other assignment types here
+        # For example, download attachments, process text, etc.
+    except Exception as e:
+        logger.error(f"Error in handle_other_assignment_type: {str(e)}")
+        raise
+        
+        # Check if we're logged out
+        if "login" in browser.url.lower():
+            await login_to_canvas(GoogleCredentials(email=os.getenv("USERNAME"), password=os.getenv("PASSWORD")), browser)
+        
+        # If we're on an unexpected page, try to navigate back to the main course page
+        course_selector = os.getenv("COURSE_SELECTOR")
+        if course_selector not in await browser.title():
+            await browser.goto("https://baps.instructure.com/")
+            await asyncio.sleep(2)
+            course_link = await browser.query_selector(f"a:has-text('{course_selector}')")
+            if course_link:
+                await course_link.click()
+                await browser.wait_for_navigation()
+        
+        # Try to find and navigate to the correct assignment again
+        await navigate_to_correct_assignment(browser, assignment_selector)
+        
+        logger.info("Error recovery and course correction completed")
+    except Exception as e:
+        logger.error(f"Failed to recover from error: {str(e)}")
+        raise
 
 if __name__ == "__main__":
     asyncio.run(main())

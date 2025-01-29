@@ -1,36 +1,35 @@
-# Browser Use Project
+# CheatSheet AI
 
-This project uses the browser-use package to automate browser interactions using Google's Gemini 1.5 Flash model.
+CheatSheet AI is an advanced AI-powered tool designed to automate and streamline the process of completing student assignments. It interacts with the Canvas learning management system to handle various types of assignments efficiently.
 
-## Setup
+## Features
 
-1. Ensure you have Python 3.11 or higher installed
 
-2. Create and activate a virtual environment using uv:
-```bash
-uv venv --python 3.11
-source .venv/bin/activate
-```
+## Installation
 
-3. Install dependencies:
-```bash
-uv pip install -r requirements.txt
-```
+1. Clone the repository:
+   ```
+   git clone https://github.com/yourusername/cheatsheet-ai.git
+   cd cheatsheet-ai
+   ```
 
-4. Install Playwright:
-```bash
-playwright install
-```
+2. Install the required dependencies:
+   ```
+   pip install -r requirements.txt
+   ```
 
-5. Configure your API key:
-   - Copy the provided `.env` file
-   - The Google API key is already configured
+3. Set up your environment variables by creating a `.env` file in the project root directory with the following content:
+   ```
+   USERNAME="your_canvas_username"
+   PASSWORD="your_canvas_password"
+   COURSE_SELECTOR="Your Course Name"
+   ASSIGNMENT_SELECTOR="Your Assignment Name"
+   GOOGLE_EMAIL="your_google_email"
+   GOOGLE_PASSWORD="your_google_password"
+   PROVIDED_GOOGLE_DOC_URL="https://docs.google.com/document/d/..."
+   GOOGLE_API_KEY="your_google_api_key"
+   ```
 
 ## Usage
 
-Run the agent with:
-```bash
-python agent.py
-```
-
-The agent will execute the specified task using browser automation and return the results. 
+Run the GUI application:

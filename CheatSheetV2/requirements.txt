@@ -1,4 +1,16 @@
 browser-use
-google-generativeai>=0.3.0
+google-generativeai
+PyQt6>=6.0.0
+qdarkstyle>=3.0.0
 python-dotenv>=1.0.0
 langchain-google-genai>=0.3.0
+beautifulsoup4>=4.9.3
+tiktoken>=0.3.0
+requests
+python-dateutil
+nltk
+pydantic
+aiohttp
+stable-baselines3
+gym
+shimmy>=2.0
